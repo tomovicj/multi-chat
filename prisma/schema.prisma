@@ -1,0 +1,9 @@
+generator client {
+  provider = "prisma-client"
+  output   = "/prisma/generated"
+}
+
+datasource db {
+  provider = "mongodb"
+  url      = env("MONGODB_URI")
+}
