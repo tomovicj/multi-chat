@@ -14,10 +14,12 @@ model User {
   email         String
   emailVerified Boolean   @default(false)
   image         String?
+  balanceCents  Int       @default(0)
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
   sessions      Session[]
   accounts      Account[]
+  chats         Chat[]
 
   @@unique([email])
   @@map("user")
@@ -69,4 +71,18 @@ model Verification {
 
   @@index([identifier])
   @@map("verification")
+}
+
+model Chat {
+  id        String   @id @default(uuid()) @map("_id")
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title     String
+  messages  Json     @default("[]")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([createdAt])
+  @@map("chat")
 }
