@@ -84,5 +84,6 @@ model Chat {
 
   @@index([userId])
   @@index([createdAt])
+  @@index([userId, title])
   @@map("chat")
 }
