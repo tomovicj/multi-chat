@@ -1,10 +1,11 @@
 import { SidebarGroup, SidebarGroupContent } from "@/components/ui/sidebar";
 import Image from "next/image";
+import { Balance } from "@/app/chat/_components/sidebar/balance";
 
 export function UserInfo({
   user,
 }: {
-  user: { name: string; email: string; image?: string | null };
+  user: { id: string; name: string; email: string; image?: string | null };
 }) {
   return (
     <SidebarGroup className="py-0">
@@ -24,6 +25,7 @@ export function UserInfo({
             <p className="text-sm text-muted-foreground">{user.email}</p>
           </div>
         </div>
+        <Balance userId={user.id} />
       </SidebarGroupContent>
     </SidebarGroup>
   );
