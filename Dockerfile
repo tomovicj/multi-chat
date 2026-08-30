@@ -6,13 +6,26 @@
 # binary it cannot use, and the app would die on its first database query.
 ARG NODE_IMAGE=node:24-bookworm-slim
 
+# ----------------------------------------------------------------------- base
+FROM ${NODE_IMAGE} AS base
+
+# OpenSSL must be present in *every* stage, not only at runtime. Prisma's
+# library engine links against it, and `prisma generate` picks its binary target
+# by detecting the installed version: on the bare slim image detection fails,
+# Prisma falls back to openssl-1.1.x, and the image ends up carrying an engine
+# its own 3.0 runtime cannot load. CI catches this now — see the docker job.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends openssl ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
+    NEXT_TELEMETRY_DISABLED=1
+
 # ---------------------------------------------------------------- dependencies
-FROM ${NODE_IMAGE} AS deps
+FROM base AS deps
 WORKDIR /app
 
-# Corepack reads the pinned version from package.json's `packageManager`. The
-# prompt suppression matters: without it corepack blocks on a non-TTY build.
-ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+# Corepack reads the pinned version from package.json's `packageManager`.
 RUN corepack enable || npm install -g pnpm@10.13.1
 
 # Only the files `pnpm install` needs, so a source edit does not invalidate the
@@ -28,12 +41,9 @@ RUN --mount=type=cache,id=pnpm-store,target=/pnpm-store \
     pnpm install --frozen-lockfile
 
 # --------------------------------------------------------------------- builder
-FROM ${NODE_IMAGE} AS builder
+FROM base AS builder
 WORKDIR /app
 
-# Corepack reads the pinned version from package.json's `packageManager`. The
-# prompt suppression matters: without it corepack blocks on a non-TTY build.
-ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 RUN corepack enable || npm install -g pnpm@10.13.1
 
 COPY --from=deps /app/node_modules ./node_modules
@@ -44,20 +54,13 @@ COPY . .
 # next/font/google at build time. Needs no secrets: lib/env.ts skips validation
 # while NEXT_PHASE is phase-production-build, and Next does not run
 # instrumentation.ts during a build.
-ENV NEXT_TELEMETRY_DISABLED=1
 RUN pnpm build
 
 # ---------------------------------------------------------------------- runner
-FROM ${NODE_IMAGE} AS runner
+FROM base AS runner
 WORKDIR /app
 
-# Prisma's library engine links against OpenSSL, which the slim image omits.
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends openssl ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
-
 ENV NODE_ENV=production \
-    NEXT_TELEMETRY_DISABLED=1 \
     PORT=3000 \
     HOSTNAME=0.0.0.0
 
