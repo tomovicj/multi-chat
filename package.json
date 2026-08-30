@@ -12,7 +12,8 @@
     "build": "next build",
     "typecheck": "tsc --noEmit",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "topup": "tsx scripts/topup.ts"
   },
   "dependencies": {
     "@ai-sdk/react": "^3.0.88",
@@ -53,6 +54,7 @@
     "eslint-config-next": "16.1.6",
     "prisma": "^6.19.2",
     "tailwindcss": "^4",
+    "tsx": "^4.23.13",
     "typescript": "^5"
   }
 }
