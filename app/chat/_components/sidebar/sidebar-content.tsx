@@ -30,9 +30,11 @@ type User = {
 export function ChatSidebarContent({
   initialChats,
   user,
+  balanceMicros,
 }: {
   initialChats: ChatListItem[];
   user: User;
+  balanceMicros: number;
 }) {
   const [searchQuery, setSearchQuery] = React.useState("");
   const [debouncedQuery] = useDebounce(searchQuery, 300);
@@ -126,7 +128,7 @@ export function ChatSidebarContent({
           <h1 className="text-3xl font-bold">Multi Chat</h1>
         </Link>
         <Separator className="my-2" />
-        <UserInfo user={user} />
+        <UserInfo user={user} balanceMicros={balanceMicros} />
         <Separator className="my-2" />
         <Button asChild variant="outline" className="w-full">
           <Link href="/chat">New Chat</Link>

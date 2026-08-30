@@ -1,43 +1,33 @@
 "use client";
 
-import { Button } from "@/components/ui/button";
-import { getUserBalance } from "@/lib/actions/user";
 import { RefreshCw } from "lucide-react";
-import { useState, useEffect } from "react";
+import { useRouter } from "next/navigation";
+import { useTransition } from "react";
 
-export function Balance() {
-  const [balance, setBalance] = useState<number | null>(null);
-  // Bumped by the refresh button to re-run the effect below. Keeping the fetch
-  // in one place avoids a second copy of it in the click handler.
-  const [refreshCount, setRefreshCount] = useState(0);
+import { Button } from "@/components/ui/button";
+import { formatMicros } from "@/lib/money";
 
-  useEffect(() => {
-    let cancelled = false;
-
-    getUserBalance().then((bal) => {
-      if (!cancelled) {
-        setBalance(bal);
-      }
-    });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [refreshCount]);
-
-  if (balance === null) {
-    return <p>Loading balance...</p>;
-  }
+/**
+ * Presentational. The balance arrives as a prop from the server-rendered
+ * sidebar, so the `router.refresh()` the chat already runs when a reply
+ * finishes updates it — no polling, and no window where the number is stale
+ * because the deduction had not committed yet.
+ */
+export function Balance({ micros }: { micros: number }) {
+  const router = useRouter();
+  const [isRefreshing, startRefresh] = useTransition();
 
   return (
     <div className="flex items-center justify-end gap-1 mt-1 -mb-2">
-      <p>Balance: {balance}</p>
+      <p>Balance: {formatMicros(micros)}</p>
       <Button
-        onClick={() => setRefreshCount((count) => count + 1)}
+        onClick={() => startRefresh(() => router.refresh())}
         size="icon"
         variant="ghost"
+        disabled={isRefreshing}
+        aria-label="Refresh balance"
       >
-        <RefreshCw />
+        <RefreshCw className={isRefreshing ? "animate-spin" : undefined} />
       </Button>
     </div>
   );

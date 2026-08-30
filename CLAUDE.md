@@ -9,8 +9,8 @@ pnpm dev                 # Next.js dev server on http://localhost:3000
 pnpm build               # production build (also type-checks)
 pnpm lint                # ESLint flat config (next core-web-vitals + typescript)
 npx tsc --noEmit         # type-check only — much faster feedback than a full build
-npx prisma db push       # push schema.prisma to MongoDB (no migrations — Mongo datasource)
 npx prisma generate      # regenerate client into prisma/generated (also runs on postinstall)
+npx prisma db push       # only needed for INDEX changes (see below)
 npx prisma studio        # DB browser
 ```
 
@@ -18,8 +18,12 @@ pnpm only — the lockfile and `pnpm-workspace.yaml` (`ignoredBuiltDependencies`
 `prisma/generated/` is gitignored, so a fresh clone type-checks only after `pnpm install` runs
 `postinstall`. There is no test framework — do not invent a test command.
 
-`prisma.config.ts` declares a `prisma/migrations` path, but that directory does not exist and
-MongoDB does not use migrations; schema changes go through `db push`.
+**MongoDB schema changes rarely need `db push`.** Mongo is schemaless, so adding or renaming a
+scalar field only requires `npx prisma generate`; `db push` matters for indexes. But `@default` is
+applied on *write*, not on read, so making a new required field on an existing collection will make
+Prisma throw on every row written before it. Declare such fields optional and convert lazily — see
+`readBalanceMicros` in `lib/billing.ts` for the pattern in use. `prisma.config.ts` names a
+`prisma/migrations` path that does not exist; Mongo does not use migrations.
 
 ## Architecture
 
@@ -33,73 +37,98 @@ existing `AGENTS.md` shows a named import, which is wrong). Google is the only s
 - Client: `authClient` from `@/lib/auth-client` (`authClient.useSession()`, `authClient.signIn.social`)
 
 There is **no middleware**. Every entry point guards itself: server components/actions `throw new
-Error("Unauthorized")`, `/api/chat` returns a 401 JSON body, and client pages (`app/chat/page.tsx`,
-`app/login/page.tsx`) redirect in a `useEffect` after `isPending` clears. `User`, `Session`,
-`Account`, `Verification` in `prisma/schema.prisma` are better-auth's tables (`@@map`ped to
-lowercase); `balanceCents` and `chats` are the app's additions to `User`.
+Error("Unauthorized")`, the route handlers return a 401 JSON body, and client pages
+(`app/chat/page.tsx`, `app/login/page.tsx`) redirect in a `useEffect` after `isPending` clears.
+`User`, `Session`, `Account`, `Verification` in `prisma/schema.prisma` are better-auth's tables
+(`@@map`ped to lowercase); `balanceMicros` and `chats` are the app's additions to `User`.
 
 ### Chat persistence — messages are a JSON *string*
 
-`Chat.messages` is a Prisma `Json` column, but every write in `lib/actions/chat.ts` passes
-`JSON.stringify(messages)`, so it holds a JSON-encoded string, not an array. Read paths must
-defensively parse (see `app/chat/[id]/page.tsx`). Keep both halves in mind when touching either.
+`Chat.messages` is a Prisma `Json` column, but every write stringifies, so it holds a JSON-encoded
+string rather than an array. Never parse it inline: use `parseStoredMessages` in
+`lib/chat/thread.ts`, which tolerates a string, a raw array, and garbage alike.
 
 ### The chat request round-trip
 
-This flow spans four files and is the core of the app:
+The core of the app, spanning `chat-thread.tsx`, `app/api/chat/route.ts`, `lib/chat/thread.ts` and
+`lib/chats.ts`:
 
-1. **The client owns the chat id.** `ChatThread` (`app/chat/_components/chat-thread.tsx`) mints one
-   with `crypto.randomUUID()` in a lazy `useState` for a new thread, or reuses the one from the
-   route params, and always posts it. Nothing needs to travel back up the stream as a result.
-2. `app/api/chat/route.ts` checks the session, refuses with **402** when `balanceCents <= 0`, then
-   looks the id up: a chat owned by someone else is answered as a **404** so ids cannot be probed,
-   and an id with no row yet is created on the spot via `createChat(chatId, title, messages)`.
-3. Only then does it stream from OpenRouter (`createOpenRouter(...).chat(modelId)` + `streamText`).
-   Persisting *before* the stream is deliberate: it means the client can navigate the instant the
-   stream ends without racing the handler, and a stream that dies midway still keeps the user's
-   message.
-4. In `onFinish`, the route computes cost from `usage` against the hardcoded `MODEL_PRICING` table,
-   calls `deductCost()`, and `updateChatMessages(chatId, ...)` with the assistant reply appended.
-   Failures there are swallowed so the stream still completes.
-5. The client's `onFinish` does `router.replace("/chat/<id>")` for a new thread — it already knew
-   the id at step 1 — and `router.refresh()` in both cases so the server-rendered sidebar picks up
-   the new or renamed chat.
+1. **The client owns the chat id.** `ChatThread` mints one with `crypto.randomUUID()` in a lazy
+   `useState` for a new thread, or reuses the route param, and always posts it. Nothing needs to
+   travel back up the stream, so finishing is a plain `router.replace` rather than a query for
+   whichever chat was created most recently.
+2. The route checks the session, refuses with **402** on an empty balance, then looks the id up. A
+   chat owned by someone else is answered **404** so ids cannot be probed.
+3. **`reconcile` (`lib/chat/thread.ts`) is the integrity check.** The client may send a prefix of
+   the stored thread plus at most one new trailing user message. A *shorter* prefix is an edit or a
+   regenerate, which deliberately rewrites history from that point — that is the product behaviour.
+   Divergence (an id where the server has a different one) is a **409**. The `base` it returns is
+   the server's own copies, so the prompt is never the client's version of history, and metadata on
+   the incoming user message is stripped rather than trusted.
+4. The thread is written **before** streaming, so the client can navigate the instant the stream
+   ends and a stream that dies midway still keeps the user's message.
+5. `toUIMessageStreamResponse({ originalMessages, messageMetadata, onFinish })` does the rest. Use
+   this rather than reconstructing the assistant message by hand: it preserves reasoning and tool
+   parts, and its `onFinish` also fires on abort, so a stopped reply is kept instead of lost.
 
-Because the id is client-supplied, **any new write path must re-check ownership** the way step 2
-does; `updateChatMessages` and `getChatById` do it by scoping `where` with `userId`.
+Errors surface as `sonner` toasts, matched by substring on the error message (`"409"`, `"402"`,
+`"401"`) — the status code is not otherwise available to the client.
 
-Errors surface as `sonner` toasts, matched by substring on the error message (`"402"`,
-`"insufficient"`, `"401"`) — the status code is not otherwise available to the client.
+### Per-message attribution
 
-### Billing
+`lib/chat/message-metadata.ts` holds one zod schema used by both halves: the route passes it through
+`messageMetadata` while streaming, the client declares it as `messageMetadataSchema` on
+`useChatRuntime`. Because metadata lives on the `UIMessage`, it survives persistence and reload for
+free, and `ChatThreadWrapper` reads the last assistant message's metadata to restore the picker when
+a chat is reopened.
 
-`User.balanceCents` is the only ledger; there is no transaction record. `MODEL_PRICING` in
-`app/api/chat/route.ts` must be kept in sync with `MODELS` in
-`app/chat/_components/model-selector.tsx` — they are two independent hardcoded lists keyed by the
-same OpenRouter model ids, and an unlisted id silently falls back to 100/300 cents per 1M tokens.
-`Balance` in the sidebar reads `getUserBalance()` on mount and on a manual refresh button; it does
-not update after a message is sent.
+**Metadata must be nested under `custom`.** assistant-ui's message converter copies only an
+allowlist of keys onto the rendered message (`unstable_state`, `unstable_annotations`,
+`unstable_data`, `steps`, `custom`, `submittedFeedback`); anything flat is silently dropped. Read it
+back with `useAuiState((s) => s.message.metadata.custom)`.
 
-`deductCost` lives in `lib/billing.ts` and is deliberately **not** a server action: it takes the user
-id from its caller, which has already resolved the session, and rejects any cost that is not a
-positive integer. Every export of a `"use server"` module is a POST endpoint clients can call with
-arguments of their choosing, so a balance mutation reachable that way can be handed a negative amount
-to credit the account. Privileged mutations belong here, not in `lib/actions/`.
+### The model catalog
+
+`lib/models/catalog.ts` fetches OpenRouter's `/api/v1/models` (~400 models, ~650 KB) and trims it to
+the fields the picker renders. The provider package ships no listing helper, so this calls REST
+directly. Server-only by convention like `lib/billing.ts` — its one importer is `app/api/models/route.ts`.
+
+- Cached across requests with `next: { revalidate: 3600 }`, plus a module-level `lastGood` so an
+  outage degrades to stale rather than empty, and `SEED_MODELS` behind that.
+- The client fetches **lazily on first popup open** (`use-model-catalog.ts`, memoised at module
+  level). Never put the catalog in the layout's RSC payload; it is far too big to pay for on every
+  page load.
+- `model-store.ts` persists a `SelectedModel` *snapshot* (id + name + provider label), not a bare
+  id, so the header labels correctly on first paint with no catalog and a model that disappears from
+  OpenRouter still shows its last known name. It is `persist` version 2 with a `migrate` off the v1
+  bare-id shape — bump both together if the shape changes again.
+- Catalog gotchas, all live in the real payload: pricing strings of `"-1"` mean **variable**, not
+  free; ~12 entries are aliases (`alias_target`, or an id starting with `~`) and are dropped as
+  duplicates; names arrive as `"Anthropic: Claude Opus 5"` and the prefix is a nicer provider label
+  than the id slug.
+
+### Billing — micro-dollars
+
+`User.balanceMicros` is the ledger, in millionths of a dollar. Whole cents were unusable: a real
+turn on a cheap model costs ~0.02¢, which rounding to cents overcharges ~50×.
+
+- Real cost comes from OpenRouter itself — `usage: { include: true }` on the model settings, then
+  `providerMetadata.openrouter.usage.cost` (USD). Note `providerMetadata` rides on the
+  **`finish-step`** stream part, not `finish`.
+- When no cost is reported, `estimateCostUsd` prices it from the live catalog. There is no hardcoded
+  price table any more, and there should not be one again.
+- `deductCost` and `readBalanceMicros` live in `lib/billing.ts`, deliberately **not** server actions
+  (see the conventions below). `lib/money.ts` holds the pure unit helpers so client components can
+  format a balance without pulling Prisma into the browser bundle.
+- The balance gate is `<= 0`, so a user can still overdraw by at most one turn.
 
 ### Sidebar (server-seeded, client-paginated)
 
-`sidebar.tsx` is a server component that queries the first 20 chats with Prisma directly and hands
-them to `sidebar-content.tsx` (client), which then owns everything: 300ms-debounced search, cursor
-pagination via the `getChats` server action, `react-intersection-observer` for infinite scroll, and
-grouping by `toDateString()`. Emptying the search resets to the server-rendered `initialChats`
-rather than refetching. `getChats` returns `{ chats, nextCursor, hasMore }` using the
-fetch-`limit + 1` / `skip: 1` cursor idiom — reuse it for any new paginated list.
-
-### Model selection
-
-A `zustand` + `persist` store (localStorage key `model-selection`) read by `ChatHeader` and each
-page, then passed down as a `selectedModel` prop. `assistant-ui` presentational components live in
-`components/assistant-ui/` and are vendored (generated), like `components/ui/`.
+`sidebar.tsx` is a server component that queries the first 20 chats and the balance, and hands them
+to `sidebar-content.tsx` (client), which owns 300ms-debounced search, cursor pagination via the
+`getChats` server action, `react-intersection-observer` infinite scroll, and date grouping. Emptying
+the search resets to the server-rendered `initialChats` rather than refetching, so `router.refresh()`
+is what makes a new, renamed or deleted chat appear.
 
 ## Conventions
 
@@ -107,49 +136,52 @@ page, then passed down as a `selectedModel` prop. `assistant-ui` presentational 
 - **Prisma:** import the singleton `prisma` from `@/lib/prisma`; never construct a `PrismaClient`.
   The generated client lives at `@/prisma/generated/client`, not `@prisma/client`.
 - **Types:** `type` aliases, not `interface`. Props typed inline for small components.
-- **Server actions** live in `lib/actions/` under `"use server"`, and each one re-checks the session
-  itself; mutations scope their `where` clause by `userId` as the authorization check. Every export
-  there is a public endpoint, so an action must be safe to invoke with hostile arguments and must
-  never accept a caller-supplied user id — derive it from the session, as `getUserBalance()` does.
-  Anything that fails that bar goes in a plain module like `lib/billing.ts` instead.
+- **Server actions are public endpoints.** Everything exported from a `"use server"` module is a
+  POST endpoint any client can call with arguments of its choosing. An action must therefore be safe
+  under hostile arguments and must **never** accept a caller-supplied user id — derive it from the
+  session. Anything failing that bar goes in a plain module instead: `lib/billing.ts` (a balance
+  mutation that could be handed a negative amount) and `lib/chats.ts` (chat writes taking an
+  arbitrary id, title and message blob). Both take `userId` from a caller that already resolved the
+  session and scope their `where` by it.
 - **Server components by default.** `"use client"` only for interactivity; `app/chat/_components/`
   is a private (non-routable) folder by the `_` prefix.
-- **Semicolons are mixed.** The older committed code (`lib/`, `app/chat/_components/sidebar/`,
-  `app/layout.tsx`, `app/login/page.tsx`) uses them; the newer AI-chat code does not. Match the file
-  you are editing. Double quotes, 2-space indent, no Prettier configured.
+- **Semicolons are mixed.** The older code (`lib/actions/`, `app/chat/_components/sidebar/`,
+  `app/layout.tsx`, `app/login/page.tsx`) uses them; the AI-chat code does not. Match the file you
+  are editing. Double quotes, 2-space indent, no Prettier configured.
 - **Styling:** Tailwind v4 via `@import` in `app/globals.css` (no tailwind.config), oklch CSS
-  variables under `@theme inline`, dark mode through the `.dark` variant. Compose classes with `cn()`
-  from `@/lib/utils`. shadcn is configured for the `radix-vega` style with the `gray` base color.
+  variables under `@theme inline`. Dark mode is `next-themes` with `attribute="class"`, which pairs
+  with the `@custom-variant dark (&:is(.dark *))` already in the stylesheet. Compose classes with
+  `cn()` from `@/lib/utils`. shadcn is configured for the `radix-vega` style, `gray` base colour.
 
-## The in-flight AI chat feature
+## Vendored UI
 
-`app/api/chat/`, `app/chat/_components/`, and `components/assistant-ui/` are untracked work in
-progress. They type-check and build, but note the AI SDK v5 → v6 conventions the installed `ai@6`
-requires, since v5-shaped snippets are still common:
+`components/ui/` and `components/assistant-ui/` are generated. Two local patches to know about, both
+of which a regenerator would clobber:
 
-- Token usage is `usage.inputTokens` / `usage.outputTokens`, and both are `number | undefined`.
-- `UIMessage` has no `content`; text lives in `message.parts`. Use the `isTextUIPart` guard from
-  `ai` to pull text out (see `getMessageText` in `app/api/chat/route.ts`).
-- `useChatRuntime` takes v6 `ChatInit`: `messages` for the initial thread and a `transport` object
-  — **not** `api` / `body` / `initialMessages`. Pass `AssistantChatTransport` from
-  `@assistant-ui/react-ai-sdk` rather than the plain `DefaultChatTransport`; it is what the hook
-  defaults to, and it forwards the runtime's system prompt and tool definitions in the request body
-  alongside your own `body` fields. `useChatRuntime` re-reads the transport through a proxy each
-  render, so constructing it inline is fine and picks up changing `body` values.
+- `attachment.tsx` — `useFileSrc` derives its object URL with `useMemo` and revokes it in an effect
+  cleanup, instead of the upstream state-plus-effect that trips `react-hooks/set-state-in-effect`.
+- `thread.tsx` — renders `Reasoning` / `ReasoningGroup` (assistant-ui defaults them to `() => null`,
+  so thinking models would otherwise show a blank pause) and `MessageMeta`, and the branch picker is
+  **removed**: branches are client-only state that does not survive a reload.
 
-`components/assistant-ui/` is vendored/generated, but `attachment.tsx` carries a local patch:
-`useFileSrc` derives the object URL with `useMemo` and revokes it in an effect cleanup, instead of
-the upstream state-plus-effect version that trips `react-hooks/set-state-in-effect`. Re-running the
-assistant-ui generator will clobber that patch and reintroduce the lint error.
+`components/ui/combobox.tsx` is a full base-ui Combobox with grouping (`ComboboxGroup`,
+`ComboboxCollection`) and external filtering via `filteredItems` — that is what the model picker
+uses to search ~400 models without a virtualizer.
 
-`pnpm lint` exits 0 with four warnings, none of them new: an unused `setCurrentChatId` (the unused
-half of the chat-id workaround above), an unused `SidebarTrigger` import in `app/chat/layout.tsx`,
-an `exhaustive-deps` warning in `balance.tsx`, and `no-img-element` in the vendored attachment
-preview.
+## Known gaps
+
+- A stale second tab sending a message looks identical to an edit — both arrive as "a prefix plus
+  one new message" — so it still truncates. Distinguishing them needs the client to report the head
+  it believed in, or a store that never deletes.
+- Tool calls are wired in the UI (`tool-fallback.tsx`) but `streamText` is never given `tools`, so
+  the component is unreachable.
+- Attachments round-trip as base64 data URLs inside `Chat.messages`, with no upload endpoint, size
+  cap, or blob store. Mongo's 16 MB document limit is the de facto ceiling.
+- `pnpm lint` exits 0 with two warnings, both pre-existing: an unused `SidebarTrigger` import in
+  `app/chat/layout.tsx`, and `no-img-element` in the vendored attachment preview.
 
 ## Other files
 
-`AGENTS.md` covers much of the same ground in more prescriptive detail; it predates the AI chat
-feature, and its "no semicolons" rule and named `auth` import are both inaccurate for the current
-tree. `agents-init.md` is just the exported transcript of the session that generated it, not
-guidance.
+`AGENTS.md` covers some of the same ground more prescriptively; it predates all of the above, and
+its "no semicolons" rule and named `auth` import are both wrong for the current tree.
+`agents-init.md` is an exported session transcript, not guidance.

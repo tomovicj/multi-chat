@@ -29,5 +29,5 @@ export default function ChatPage() {
     return null
   }
 
-  return <ChatThread selectedModel={selectedModel} />
+  return <ChatThread modelId={selectedModel.id} />
 }

@@ -1,51 +1,52 @@
 import { createOpenRouter } from "@openrouter/ai-sdk-provider"
 import { streamText, convertToModelMessages, isTextUIPart } from "ai"
-import type { UIMessage } from "ai"
+import type { ProviderMetadata } from "ai"
 import auth from "@/lib/auth"
 import prisma from "@/lib/prisma"
-import { createChat, updateChatMessages } from "@/lib/actions/chat"
-import { deductCost } from "@/lib/billing"
+import type { ChatUIMessage } from "@/lib/chat/message-metadata"
+import { parseStoredMessages, reconcile } from "@/lib/chat/thread"
+import { createChatRow, saveChatMessages } from "@/lib/chats"
+import { deductCost, readBalanceMicros } from "@/lib/billing"
+import { estimateCostUsd, getModelCatalog } from "@/lib/models/catalog"
+import type { CatalogModel } from "@/lib/models/types"
+import { usdToMicros } from "@/lib/money"
 import { headers } from "next/headers"
 
-export const maxDuration = 60
+export const maxDuration = 120
 
 type ChatRequest = {
-  messages: UIMessage[]
+  messages: ChatUIMessage[]
   chatId: string
   modelId?: string
 }
 
-// OpenRouter pricing (approximate, in cents per 1M tokens)
-const MODEL_PRICING = {
-  input: {
-    "anthropic/claude-3.5-sonnet": 300, // $3 per 1M tokens
-    "openai/gpt-4o": 250, // $2.50 per 1M tokens
-    "openai/gpt-4o-mini": 15, // $0.15 per 1M tokens
-    "meta-llama/llama-3.3-70b-instruct": 18, // $0.18 per 1M tokens
-    "google/gemini-2.0-flash-exp:free": 0, // Free
-    "mistralai/mistral-large-2411": 200, // $2 per 1M tokens
-  },
-  output: {
-    "anthropic/claude-3.5-sonnet": 1500, // $15 per 1M tokens
-    "openai/gpt-4o": 1000, // $10 per 1M tokens
-    "openai/gpt-4o-mini": 60, // $0.60 per 1M tokens
-    "meta-llama/llama-3.3-70b-instruct": 18, // $0.18 per 1M tokens
-    "google/gemini-2.0-flash-exp:free": 0, // Free
-    "mistralai/mistral-large-2411": 600, // $6 per 1M tokens
-  },
+/**
+ * Pull the real cost of a turn out of OpenRouter's usage accounting, in micros.
+ *
+ * Requires `usage: { include: true }` on the model settings, below. OpenRouter
+ * reports `cost` in USD credits. Returns null when no cost came back — free
+ * models, aborted turns, and some providers — leaving the caller to fall back
+ * to the catalog's rates.
+ */
+function costMicrosFromMetadata(
+  metadata: ProviderMetadata | undefined,
+): number | null {
+  const usage = metadata?.openrouter?.usage
+
+  if (!usage || typeof usage !== "object" || Array.isArray(usage)) {
+    return null
+  }
+
+  const cost = (usage as { cost?: unknown }).cost
+
+  if (typeof cost !== "number" || !Number.isFinite(cost) || cost <= 0) {
+    return null
+  }
+
+  return usdToMicros(cost)
 }
 
-function calculateCost(modelId: string, promptTokens: number, completionTokens: number): number {
-  const inputCostPerMillion = MODEL_PRICING.input[modelId as keyof typeof MODEL_PRICING.input] || 100
-  const outputCostPerMillion = MODEL_PRICING.output[modelId as keyof typeof MODEL_PRICING.output] || 300
-
-  const inputCost = (promptTokens / 1_000_000) * inputCostPerMillion
-  const outputCost = (completionTokens / 1_000_000) * outputCostPerMillion
-
-  return Math.ceil(inputCost + outputCost) // Round up to nearest cent
-}
-
-function getMessageText(message: UIMessage): string {
+function getMessageText(message: ChatUIMessage): string {
   return message.parts.filter(isTextUIPart).map((part) => part.text).join("")
 }
 
@@ -63,28 +64,25 @@ export async function POST(req: Request) {
       return Response.json({ error: "Unauthorized" }, { status: 401 })
     }
 
-    // Parse request
-    const { messages, chatId, modelId = "openai/gpt-4o-mini" }: ChatRequest = await req.json()
+    const {
+      messages,
+      chatId,
+      modelId = "openai/gpt-4o-mini",
+    }: ChatRequest = await req.json()
 
-    if (!messages || messages.length === 0) {
+    if (!Array.isArray(messages) || messages.length === 0) {
       return Response.json({ error: "No messages provided" }, { status: 400 })
     }
 
-    if (!chatId) {
+    if (!chatId || typeof chatId !== "string") {
       return Response.json({ error: "No chatId provided" }, { status: 400 })
     }
 
-    // Check user balance
-    const user = await prisma.user.findUnique({
-      where: { id: session.user.id },
-      select: { balanceCents: true },
-    })
+    // Check user balance. This also converts a pre-micro-dollar account on
+    // first use, so no offline migration is needed.
+    const balanceMicros = await readBalanceMicros(session.user.id)
 
-    if (!user) {
-      return Response.json({ error: "User not found" }, { status: 404 })
-    }
-
-    if (user.balanceCents <= 0) {
+    if (balanceMicros <= 0) {
       return Response.json(
         { error: "Insufficient balance. Please add credits to continue." },
         { status: 402 },
@@ -96,67 +94,128 @@ export async function POST(req: Request) {
     // last case the same way as a missing chat so ids cannot be probed.
     const existing = await prisma.chat.findUnique({
       where: { id: chatId },
-      select: { userId: true },
+      select: { userId: true, messages: true },
     })
 
     if (existing && existing.userId !== session.user.id) {
       return Response.json({ error: "Chat not found" }, { status: 404 })
     }
 
-    // Write the row before streaming rather than in onFinish, so the client can
-    // navigate to /chat/<id> the moment the stream ends without racing this
+    // Reconcile the client's view of the thread against the stored one. `base`
+    // comes back as the server's own copies of past turns, so what gets sent to
+    // the model is never the client's version of history.
+    const stored = parseStoredMessages(existing?.messages)
+    const reconciliation = reconcile(stored, messages)
+
+    if (!reconciliation.ok) {
+      return Response.json({ error: reconciliation.reason }, { status: 409 })
+    }
+
+    const { base, newUserMessage } = reconciliation
+    const thread = newUserMessage ? [...base, newUserMessage] : base
+
+    if (thread.length === 0) {
+      return Response.json({ error: "Nothing to answer" }, { status: 400 })
+    }
+
+    // Resolve the model against the live catalog: it prices the turn when
+    // OpenRouter reports no cost of its own, and it catches a stale model id
+    // before the request is spent. A degraded catalog must not reject anything,
+    // since we cannot tell a bad id from a list we failed to load.
+    const catalog = await getModelCatalog()
+    const model: CatalogModel | undefined = catalog.models.find(
+      (entry) => entry.id === modelId,
+    )
+
+    if (!model && !catalog.degraded) {
+      return Response.json(
+        { error: `Unknown model: ${modelId}` },
+        { status: 400 },
+      )
+    }
+
+    // Write the thread before streaming rather than afterwards, so the client
+    // can navigate to /chat/<id> the moment the stream ends without racing this
     // handler, and so a stream that dies midway still keeps the user's message.
-    if (!existing) {
-      const firstUserMessage = messages.find((m) => m.role === "user")
+    if (existing) {
+      await saveChatMessages(chatId, session.user.id, thread, modelId)
+    } else {
+      const firstUserMessage = thread.find((m) => m.role === "user")
       const title = firstUserMessage
         ? generateTitleFromMessage(getMessageText(firstUserMessage) || "New Chat")
         : "New Chat"
 
-      await createChat(chatId, title, messages)
+      await createChatRow(chatId, session.user.id, title, thread, modelId)
     }
 
-    // Create OpenRouter client
     const openrouter = createOpenRouter({
       apiKey: process.env.OPENROUTER_API_KEY,
     })
 
-    // Stream response
     const result = streamText({
-      model: openrouter.chat(modelId),
-      messages: await convertToModelMessages(messages),
-      async onFinish({ usage, text }) {
-        try {
-          // Calculate cost
-          const costInCents = calculateCost(
-            modelId,
-            usage.inputTokens ?? 0,
-            usage.outputTokens ?? 0,
-          )
+      model: openrouter.chat(modelId, { usage: { include: true } }),
+      messages: await convertToModelMessages(thread),
+      // Stop burning tokens upstream when the reader goes away.
+      abortSignal: req.signal,
+      onError({ error }) {
+        console.error("Stream error:", error)
+      },
+    })
 
-          // Deduct cost from user balance
-          if (costInCents > 0) {
-            await deductCost(session.user.id, costInCents)
+    // Captured from the metadata callback below and spent in onFinish. The
+    // stream transform runs the callback for every part before flushing, so
+    // this is always set by the time onFinish reads it.
+    let costMicros = 0
+
+    return result.toUIMessageStreamResponse<ChatUIMessage>({
+      originalMessages: thread,
+      generateMessageId: () => crypto.randomUUID(),
+      messageMetadata: ({ part }) => {
+        if (part.type === "start") {
+          return {
+            custom: {
+              modelId,
+              modelName: model?.name ?? modelId,
+              providerLabel: model?.providerLabel ?? "",
+            },
+          }
+        }
+
+        // `providerMetadata` rides on finish-step, not finish.
+        if (part.type === "finish-step") {
+          const inputTokens = part.usage.inputTokens ?? 0
+          const outputTokens = part.usage.outputTokens ?? 0
+
+          // Prefer what OpenRouter actually charged; fall back to the live
+          // catalog's rates, which beat the hardcoded table this replaced.
+          costMicros =
+            costMicrosFromMetadata(part.providerMetadata) ??
+            usdToMicros(estimateCostUsd(model, inputTokens, outputTokens))
+
+          return { custom: { costMicros, inputTokens, outputTokens } }
+        }
+
+        return undefined
+      },
+      onFinish: async ({ messages: finalMessages }) => {
+        // Runs on abort too, so a stopped reply is kept rather than lost.
+        try {
+          if (costMicros > 0) {
+            await deductCost(session.user.id, costMicros)
           }
 
-          // Prepare updated messages (append assistant response)
-          const updatedMessages: UIMessage[] = [
-            ...messages,
-            {
-              id: crypto.randomUUID(),
-              role: "assistant",
-              parts: [{ type: "text", text }],
-            },
-          ]
-
-          await updateChatMessages(chatId, updatedMessages)
+          await saveChatMessages(
+            chatId,
+            session.user.id,
+            finalMessages,
+            modelId,
+          )
         } catch (error) {
-          console.error("Error in onFinish:", error)
+          console.error("Error persisting chat:", error)
           // Don't throw - let the stream complete even if persistence fails
         }
       },
     })
-
-    return result.toUIMessageStreamResponse()
   } catch (error) {
     console.error("Chat API error:", error)
     return Response.json(

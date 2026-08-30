@@ -14,7 +14,16 @@ model User {
   email         String
   emailVerified Boolean   @default(false)
   image         String?
-  balanceCents  Int       @default(0)
+  /// Superseded by balanceMicros. Kept, and optional, so documents written
+  /// before the ledger changed units still read back and can be converted on
+  /// first use. Safe to drop once every user row has a balanceMicros.
+  balanceCents  Int?
+  /// Balance in micro-dollars (millionths of a USD): $5.00 is 5_000_000.
+  /// Chosen over whole cents because real per-turn costs are routinely well
+  /// under a cent. Prisma Int is Int32 on MongoDB, so the ceiling is ~$2,147.
+  /// Optional because MongoDB applies @default on write, not on read: a
+  /// document predating this field would otherwise fail to deserialize.
+  balanceMicros Int?
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
   sessions      Session[]
@@ -79,6 +88,9 @@ model Chat {
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   title     String
   messages  Json     @default("[]")
+  /// Last model that answered in this chat, so reopening it restores the
+  /// choice. Optional: chats created before this field simply have none.
+  model     String?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 

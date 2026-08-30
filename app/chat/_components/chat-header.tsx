@@ -8,12 +8,17 @@ import { Separator } from "@/components/ui/separator"
 export function ChatHeader() {
   const selectedModel = useModelStore((state) => state.selectedModel)
   const setSelectedModel = useModelStore((state) => state.setSelectedModel)
+  const recentIds = useModelStore((state) => state.recentIds)
 
   return (
     <header className="flex h-16 shrink-0 items-center gap-2 border-b px-4">
       <SidebarTrigger className="-ml-1" />
       <Separator orientation="vertical" className="h-6" />
-      <ModelSelector value={selectedModel} onValueChange={setSelectedModel} />
+      <ModelSelector
+        value={selectedModel}
+        onValueChange={setSelectedModel}
+        recentIds={recentIds}
+      />
     </header>
   )
 }

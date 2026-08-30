@@ -4,6 +4,7 @@ import { Sidebar } from "@/components/ui/sidebar";
 import prisma from "@/lib/prisma";
 import { headers } from "next/headers";
 import auth from "@/lib/auth";
+import { readBalanceMicros } from "@/lib/billing";
 import { ChatSidebarContent } from "@/app/chat/_components/sidebar/sidebar-content";
 
 export async function ChatSidebar({
@@ -14,6 +15,8 @@ export async function ChatSidebar({
   if (!session) {
     return null;
   }
+
+  const balanceMicros = await readBalanceMicros(session.user.id);
 
   // Fetch initial page of chats (first 20)
   const initialChats = await prisma.chat.findMany({
@@ -33,7 +36,11 @@ export async function ChatSidebar({
 
   return (
     <Sidebar {...props}>
-      <ChatSidebarContent initialChats={initialChats} user={session.user} />
+      <ChatSidebarContent
+        initialChats={initialChats}
+        user={session.user}
+        balanceMicros={balanceMicros}
+      />
     </Sidebar>
   );
 }
