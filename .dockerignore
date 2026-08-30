@@ -1,0 +1,21 @@
+# Never bake secrets into an image layer.
+.env
+.env.*
+!.env.example
+
+node_modules
+.next
+.git
+.github
+.vscode
+
+# Regenerated inside the image on purpose: the query engine it emits is a
+# native binary compiled for whatever platform ran `prisma generate`, so the
+# host's copy would be wrong for the container.
+prisma/generated
+
+*.tsbuildinfo
+Dockerfile
+.dockerignore
+docker-compose.yml
+agents-init.md
