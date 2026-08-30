@@ -98,13 +98,16 @@ jobs:
       # orchestrator reads as healthy.
       - name: Missing configuration aborts startup
         run: |
-          if docker run --rm --name badenv \
-               -e MONGODB_URI=mongodb://127.0.0.1:27017/smoke \
-               -e BETTER_AUTH_URL=http://localhost:3000 \
-               -e BETTER_AUTH_SECRET=ci-smoke-secret-that-is-long-enough-000 \
-               -e OAUTH_GOOGLE_CLIENT_ID=smoke \
-               -e OAUTH_GOOGLE_CLIENT_SECRET=smoke \
-               multi-chat:ci 2>&1 | tee /tmp/badenv.log; then
+          status=0
+          docker run --rm --name badenv \
+            -e MONGODB_URI=mongodb://127.0.0.1:27017/smoke \
+            -e BETTER_AUTH_URL=http://localhost:3000 \
+            -e BETTER_AUTH_SECRET=ci-smoke-secret-that-is-long-enough-000 \
+            -e OAUTH_GOOGLE_CLIENT_ID=smoke \
+            -e OAUTH_GOOGLE_CLIENT_SECRET=smoke \
+            multi-chat:ci > /tmp/badenv.log 2>&1 || status=$?
+          cat /tmp/badenv.log
+          if [ "$status" -eq 0 ]; then
             echo "::error::server stayed up with OPENROUTER_API_KEY missing"; exit 1
           fi
           grep -q "OPENROUTER_API_KEY" /tmp/badenv.log
