@@ -8,10 +8,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 pnpm dev                 # Next.js dev server on http://localhost:3000
 pnpm build               # production build (also type-checks)
 pnpm lint                # ESLint flat config (next core-web-vitals + typescript)
-npx tsc --noEmit         # type-check only — much faster feedback than a full build
+pnpm typecheck           # tsc --noEmit — much faster feedback than a full build
+pnpm topup <email> <$>   # grant credit; there is no admin UI or payment provider
 npx prisma generate      # regenerate client into prisma/generated (also runs on postinstall)
 npx prisma db push       # only needed for INDEX changes (see below)
 npx prisma studio        # DB browser
+docker compose up --build   # run the production image locally, reads .env
 ```
 
 pnpm only — the lockfile and `pnpm-workspace.yaml` (`ignoredBuiltDependencies`) assume it.
@@ -24,6 +26,22 @@ applied on *write*, not on read, so making a new required field on an existing c
 Prisma throw on every row written before it. Declare such fields optional and convert lazily — see
 `readBalanceMicros` in `lib/billing.ts` for the pattern in use. `prisma.config.ts` names a
 `prisma/migrations` path that does not exist; Mongo does not use migrations.
+
+## Git workflow
+
+**Branch, commit small, open a PR.** Do not commit onto `dev` directly and do not deliver a change
+as one large commit.
+
+- `main` is the default branch but `dev` is where work integrates, so branch off `dev` and target
+  the PR at `dev` unless told otherwise.
+- Split the work into commits that each stand alone: one coherent concern per commit, and each one
+  should build if checked out on its own. That usually means a new module ships together with the
+  call sites that use it, while unrelated concerns — a config fix, a new endpoint, documentation —
+  stay in separate commits.
+- When one file (typically `package.json`) belongs to two commits, write its intermediate content,
+  commit, then write the final content and commit again. That is more reliable than trying to stage
+  individual hunks non-interactively.
+- Push the branch and open the PR with `gh pr create`.
 
 ## Architecture
 
@@ -130,6 +148,36 @@ to `sidebar-content.tsx` (client), which owns 300ms-debounced search, cursor pag
 the search resets to the server-rendered `initialChats` rather than refetching, so `router.refresh()`
 is what makes a new, renamed or deleted chat appear.
 
+## Infrastructure
+
+The app builds and runs with **no secrets**, and validates configuration on **startup**. Two traps
+are load-bearing to that and are easy to undo by accident:
+
+- **`prisma.config.ts` must not use `env()` from `prisma/config`.** That helper *throws* when the
+  variable is unset, and the config file is loaded by every Prisma CLI command — including the
+  `prisma generate` that `postinstall` runs. Using it makes `pnpm install` fail in CI, in Docker and
+  on any clean checkout without a database. It reads `process.env.MONGODB_URI` directly instead, and
+  falls back to an obviously-invalid URL so commands that really connect still fail legibly.
+- **The Docker image must stay Debian in every stage.** `prisma generate` emits a native query
+  engine for whatever platform ran it — here `libquery_engine-debian-openssl-3.0.x.so.node` — and
+  `prisma/generated/client.ts` resolves it from `process.cwd()`. Alpine needs
+  `linux-musl-openssl-3.0.x`, so a musl runtime dies on the first query. The runner stage copies
+  `prisma/generated` explicitly rather than trusting Next's file tracing to carry a `.so`.
+
+`lib/env.ts` is the only place that reads a secret from `process.env`; everything else calls `env()`.
+It parses once, reports *every* bad variable at once, and short-circuits while
+`NEXT_PHASE === "phase-production-build"` — which is what lets `next build` and `docker build` run
+without credentials. The real check is `instrumentation.ts`, whose `register()` Next runs at server
+boot and (verified in Next's own source) deliberately *not* during a build.
+
+`lib/auth-client.ts` passes **no `baseURL`**: better-auth falls back to `window.location.origin`.
+Naming one would mean a `NEXT_PUBLIC_*` variable, and those are inlined at build time — which would
+pin every built image to a single hostname. The server side sets `baseURL` from `BETTER_AUTH_URL`.
+
+`/api/health` is liveness only and never touches Mongo, so an upstream blip cannot turn into a
+restart loop. `.github/workflows/ci.yml` runs typecheck, lint and build plus an independent
+`docker build`; making them block a merge is a branch-protection setting, not a file.
+
 ## Conventions
 
 - **Imports:** always the `@/*` alias, never relative paths (`@/` maps to the repo root).
@@ -182,6 +230,7 @@ uses to search ~400 models without a virtualizer.
 
 ## Other files
 
+`README.md` is the human-facing setup guide: prerequisites, environment variables, Docker and CI.
 `AGENTS.md` covers some of the same ground more prescriptively; it predates all of the above, and
 its "no semicolons" rule and named `auth` import are both wrong for the current tree.
 `agents-init.md` is an exported session transcript, not guidance.

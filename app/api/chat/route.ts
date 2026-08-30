@@ -7,6 +7,7 @@ import type { ChatUIMessage } from "@/lib/chat/message-metadata"
 import { parseStoredMessages, reconcile } from "@/lib/chat/thread"
 import { createChatRow, saveChatMessages } from "@/lib/chats"
 import { deductCost, readBalanceMicros } from "@/lib/billing"
+import { env } from "@/lib/env"
 import { estimateCostUsd, getModelCatalog } from "@/lib/models/catalog"
 import type { CatalogModel } from "@/lib/models/types"
 import { usdToMicros } from "@/lib/money"
@@ -149,7 +150,7 @@ export async function POST(req: Request) {
     }
 
     const openrouter = createOpenRouter({
-      apiKey: process.env.OPENROUTER_API_KEY,
+      apiKey: env().OPENROUTER_API_KEY,
     })
 
     const result = streamText({

@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+import { env } from "@/lib/env";
+
 import {
   DEFAULT_MODEL_ID,
   type CatalogModel,
@@ -149,9 +151,7 @@ function collectProviderLabels(entries: RawModel[]): Map<string, string> {
 
 async function fetchCatalog(): Promise<ModelCatalog> {
   const response = await fetch(MODELS_URL, {
-    headers: process.env.OPENROUTER_API_KEY
-      ? { Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}` }
-      : undefined,
+    headers: { Authorization: `Bearer ${env().OPENROUTER_API_KEY}` },
     next: { revalidate: REVALIDATE_SECONDS },
   });
 

@@ -1,0 +1,15 @@
+# Runs the production image locally the same way a host would, so the container
+# path is exercised in development instead of only in CI.
+#
+#   docker compose up --build
+#
+# Reads the same .env the dev server uses. Note BETTER_AUTH_URL must match the
+# origin the browser actually visits, or the Google OAuth round-trip fails.
+services:
+  web:
+    build: .
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    restart: unless-stopped

@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+# A second push to the same branch makes the first run pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Typecheck, lint, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Reads the version from package.json's `packageManager` field.
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      # `postinstall` runs `prisma generate`, which loads prisma.config.ts.
+      # That file reads MONGODB_URI without prisma/config's `env()` helper
+      # precisely so this step works with no database and no secrets.
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm typecheck
+      - run: pnpm lint
+
+      # No secrets here either: `lib/env.ts` skips validation during
+      # NEXT_PHASE=phase-production-build, and the boot-time check lives in
+      # instrumentation.ts, which Next does not run for a build.
+      - run: pnpm build
+
+  docker:
+    name: Docker image builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Independent of the job above on purpose: it is the only thing that
+      # catches the Dockerfile drifting out of sync with the app.
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: multi-chat:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The image built fine while carrying an engine its own runtime could not
+      # load, because `prisma generate` ran on a stage with no OpenSSL and fell
+      # back to openssl-1.1.x. Nothing noticed until the first database query,
+      # so assert the binary target instead of trusting the build to be silent.
+      - name: Query engine matches the runtime
+        run: |
+          engine=$(docker run --rm --entrypoint ls multi-chat:ci prisma/generated \
+                   | grep libquery_engine)
+          echo "engine: $engine"
+          case "$engine" in
+            *debian-openssl-3.0.x*) ;;
+            *) echo "::error::wrong query engine for this base image: $engine"; exit 1 ;;
+          esac
+
+      # A build that produces an unstartable image is not a passing build. The
+      # values below only have to satisfy lib/env.ts — /api/health never opens a
+      # database connection, so the Mongo URI is never dialled.
+      - name: Container boots and serves /api/health
+        run: |
+          docker run -d --name smoke -p 3000:3000 \
+            -e MONGODB_URI=mongodb://127.0.0.1:27017/smoke \
+            -e BETTER_AUTH_URL=http://localhost:3000 \
+            -e BETTER_AUTH_SECRET=ci-smoke-secret-that-is-long-enough-000 \
+            -e OAUTH_GOOGLE_CLIENT_ID=smoke \
+            -e OAUTH_GOOGLE_CLIENT_SECRET=smoke \
+            -e OPENROUTER_API_KEY=smoke \
+            multi-chat:ci
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:3000/api/health && ok=1 && break
+            sleep 2
+          done
+          echo
+          docker logs smoke
+          docker rm -f smoke >/dev/null
+          test "${ok:-0}" = 1
+
+      # Guards the deliberate process.exit(1) in instrumentation.ts: Next would
+      # otherwise leave a misconfigured server up answering 500s, which an
+      # orchestrator reads as healthy.
+      - name: Missing configuration aborts startup
+        run: |
+          status=0
+          docker run --rm --name badenv \
+            -e MONGODB_URI=mongodb://127.0.0.1:27017/smoke \
+            -e BETTER_AUTH_URL=http://localhost:3000 \
+            -e BETTER_AUTH_SECRET=ci-smoke-secret-that-is-long-enough-000 \
+            -e OAUTH_GOOGLE_CLIENT_ID=smoke \
+            -e OAUTH_GOOGLE_CLIENT_SECRET=smoke \
+            multi-chat:ci > /tmp/badenv.log 2>&1 || status=$?
+          cat /tmp/badenv.log
+          if [ "$status" -eq 0 ]; then
+            echo "::error::server stayed up with OPENROUTER_API_KEY missing"; exit 1
+          fi
+          grep -q "OPENROUTER_API_KEY" /tmp/badenv.log
