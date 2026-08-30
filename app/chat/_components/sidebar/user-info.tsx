@@ -25,7 +25,7 @@ export function UserInfo({
             <p className="text-sm text-muted-foreground">{user.email}</p>
           </div>
         </div>
-        <Balance userId={user.id} />
+        <Balance />
       </SidebarGroupContent>
     </SidebarGroup>
   );
