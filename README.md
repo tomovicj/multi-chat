@@ -43,11 +43,13 @@ pnpm topup you@example.com 5
 | `pnpm build` | Production build (also type-checks) |
 | `pnpm typecheck` | `tsc --noEmit` — much faster feedback than a full build |
 | `pnpm lint` | ESLint |
+| `pnpm test` | Vitest, once (`pnpm vitest` to watch) |
 | `pnpm topup <email> <dollars>` | Add credit to an account |
 | `npx prisma generate` | Regenerate the client into `prisma/generated` |
 | `npx prisma studio` | Browse the database |
 
-There is no test framework.
+The tests are Vitest, run in Node with every I/O boundary mocked, so they need
+no database, no secrets and no network. `tests/` mirrors the source tree.
 
 **Schema changes rarely need `npx prisma db push`.** Mongo is schemaless, so
 adding or renaming a scalar field only needs `prisma generate`; `db push`
@@ -90,8 +92,8 @@ load a binary it cannot use and die on the first database query.
 
 ## CI
 
-`.github/workflows/ci.yml` runs typecheck, lint and build on pushes to `main`
-and `dev` and on every PR, plus an independent job that builds the Docker image.
+`.github/workflows/ci.yml` runs typecheck, lint, test and build on pushes to
+`main` and `dev` and on every PR, plus an independent job that builds the Docker image.
 It needs no secrets.
 
 Making those checks *block* a merge is a repository setting, not a file —

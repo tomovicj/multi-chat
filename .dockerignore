@@ -14,6 +14,10 @@ node_modules
 # host's copy would be wrong for the container.
 prisma/generated
 
+# The test suite never runs inside the image; CI runs it directly.
+tests
+vitest.config.mts
+
 *.tsbuildinfo
 Dockerfile
 .dockerignore

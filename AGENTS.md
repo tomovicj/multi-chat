@@ -37,6 +37,10 @@ pnpm build               # Production build (runs type checking)
 pnpm lint                # Run ESLint on all files
 pnpm lint --fix          # Auto-fix linting issues
 
+# Test
+pnpm test                # Run the Vitest suite once
+pnpm vitest              # Watch mode
+
 # Database
 npx prisma generate      # Generate Prisma client (auto-runs on install)
 npx prisma db push       # Push schema changes to MongoDB
@@ -46,7 +50,10 @@ npx prisma studio        # Open Prisma Studio GUI
 pnpm start               # Start production server (requires build)
 ```
 
-**Testing:** No test framework configured. If adding tests, prefer Vitest or Jest.
+**Testing:** Vitest, in `tests/`, mirroring the source tree. Every I/O boundary is mocked, so
+the suite needs no database, no secrets and no network. See the Testing section of `CLAUDE.md`
+before adding to it — the setup file's globals and the module-level singletons that need
+`vi.resetModules()` are both easy to trip over.
 
 ## Code Style Guidelines
 
@@ -398,7 +405,7 @@ return (
 ## Important Notes
 
 - **No Prettier configured** - Follow formatting conventions manually
-- **No test framework** - If adding tests, set up Vitest or Jest first
+- **Vitest in `tests/`** - Mocked at every I/O boundary; no database or secrets needed
 - **MongoDB + Prisma** - Use Prisma schema, not raw MongoDB queries
 - **pnpm only** - Do not use npm or yarn
 - **Strict TypeScript** - All code must pass strict type checking
