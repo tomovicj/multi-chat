@@ -8,6 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 pnpm dev                 # Next.js dev server on http://localhost:3000
 pnpm build               # production build (also type-checks)
 pnpm lint                # ESLint flat config (next core-web-vitals + typescript)
+pnpm test                # Vitest, once; `pnpm vitest` watches
 pnpm typecheck           # tsc --noEmit — much faster feedback than a full build
 pnpm topup <email> <$>   # grant credit; there is no admin UI or payment provider
 npx prisma generate      # regenerate client into prisma/generated (also runs on postinstall)
@@ -18,7 +19,7 @@ docker compose up --build   # run the production image locally, reads .env
 
 pnpm only — the lockfile and `pnpm-workspace.yaml` (`ignoredBuiltDependencies`) assume it.
 `prisma/generated/` is gitignored, so a fresh clone type-checks only after `pnpm install` runs
-`postinstall`. There is no test framework — do not invent a test command.
+`postinstall`.
 
 **MongoDB schema changes rarely need `db push`.** Mongo is schemaless, so adding or renaming a
 scalar field only requires `npx prisma generate`; `db push` matters for indexes. But `@default` is
@@ -175,8 +176,40 @@ Naming one would mean a `NEXT_PUBLIC_*` variable, and those are inlined at build
 pin every built image to a single hostname. The server side sets `baseURL` from `BETTER_AUTH_URL`.
 
 `/api/health` is liveness only and never touches Mongo, so an upstream blip cannot turn into a
-restart loop. `.github/workflows/ci.yml` runs typecheck, lint and build plus an independent
+restart loop. `.github/workflows/ci.yml` runs typecheck, lint, test and build plus an independent
 `docker build`; making them block a merge is a branch-protection setting, not a file.
+
+## Testing
+
+Vitest, `environment: "node"`, config in `vitest.config.mts` (`.mts` because the package has no
+`"type": "module"`, so a `.ts` config loads as CommonJS and warns). Tests live in `tests/`,
+mirroring the source tree, and import through the `@/*` alias like everything else — including
+`@/tests/fixtures`. `describe`/`it`/`expect`/`vi` are imported explicitly rather than enabled as
+globals: `tsconfig.json` has no `types` array, so setting one would disable auto-inclusion of the
+`node` and `react` types and force them to be re-listed.
+
+- **Every I/O boundary is mocked** — `@/lib/prisma`, `@/lib/auth`, `next/headers`, `fetch`, and
+  `@openrouter/ai-sdk-provider`. The suite needs no database, no secrets and no network, which is
+  what lets it run in CI alongside typecheck and lint.
+- **`tests/setup.ts` installs two globals before any module loads.** The six variables `lib/env.ts`
+  validates, because `lib/auth.ts` calls `env()` at module scope; and an in-memory
+  `window.localStorage`, because zustand's `persist` defaults its storage to `window.localStorage`
+  and, when that is missing, returns *without attaching the `persist` API at all* — which would
+  make `model-store.ts` untestable rather than merely unpersisted. That stub is why there is no
+  jsdom or happy-dom dependency.
+- **Module-private helpers are tested through their public entry point, not exported for the
+  tests.** `parsePricing`/`toCatalogModel`/`collectProviderLabels` run via `getModelCatalog` with a
+  stubbed `fetch`; `costMicrosFromMetadata`/`generateTitleFromMessage` via `POST`. The pipeline is
+  what is worth trusting, and the module surfaces stay as they are.
+- **Three module-level singletons need `vi.resetModules()` between cases**: `cached` in `lib/env.ts`,
+  `lastGood` in `lib/models/catalog.ts`, and the store in `model-store.ts`.
+- **The chat route is tested against a real stream.** `createOpenRouter` is stubbed to return a
+  `MockLanguageModelV3` from `ai/test`, so `streamText` and `toUIMessageStreamResponse` run for
+  real. Usage on the mock's `finish` chunk must use the provider-level *nested* shape
+  (`inputTokens: { total }`); the flat shape is silently dropped and the token counts arrive as
+  zero, which quietly makes any cost assertion vacuous.
+- Not covered: React component rendering, anything needing a live MongoDB, and `instrumentation.ts`
+  (whose `process.exit(1)` the Docker CI job already exercises by booting a container).
 
 ## Conventions
 
