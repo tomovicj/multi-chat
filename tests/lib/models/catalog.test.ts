@@ -1,11 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import type { CatalogModel, ModelCatalog } from "@/lib/models/types"
-import {
-  OPENROUTER_MODELS_PAYLOAD,
-  catalogModel,
-  modelsResponse,
-} from "@/tests/fixtures"
+import { catalogModel, modelsResponse } from "@/tests/fixtures"
 
 /**
  * The trimming helpers — `parsePricing`, `toCatalogModel`,
